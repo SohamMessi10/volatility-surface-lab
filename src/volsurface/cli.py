@@ -321,7 +321,7 @@ def cmd_fetch(args: argparse.Namespace) -> int:
             max_expiries=args.max_expiries,
             min_days=args.min_days,
             max_days=args.max_days,
-            fallback_rate=args.fallback_rate,
+            rate=args.rate,
         )
     except ImportError as e:
         raise CliError(str(e)) from e
@@ -412,10 +412,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-days", type=int, default=7, help="skip expiries sooner than this (7)")
     p.add_argument("--max-days", type=int, default=730, help="skip expiries later than this (730)")
     p.add_argument(
-        "--fallback-rate",
+        "--rate",
         type=float,
         default=0.04,
-        help="rate used when put-call parity cannot imply the forward (0.04)",
+        help="risk-free rate for discounting; the forward comes from put-call parity (0.04)",
     )
     return ap
 

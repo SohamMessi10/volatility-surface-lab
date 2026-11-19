@@ -4,20 +4,23 @@ What it does: for a symbol (default ``SPY``) it reads the listed expiries and op
 ``yfinance``, cleans the quotes, and returns the same OTM-quote container used by the synthetic
 pipeline (``true_price`` and ``iv_true`` are ``nan``, ``heston`` is ``None``).
 
-Forward and discount factor: instead of guessing dividends and rates, both are *implied by
-put-call parity* per expiry. With ``C - P = df * (F - K)``, a least-squares regression of the
-call-minus-put mid difference on ``K`` over strikes quoted on both sides within +-10% of spot
-gives slope ``-df`` and intercept ``df * F``. This needs at least 3 such strikes and a sane
-``0.5 < df <= 1.05``; otherwise the expiry falls back to ``F = S exp(rT)``, ``df = exp(-rT)``
-with ``fallback_rate`` (reported as method ``"fallback"``). American-style early-exercise premia
-and stale mids make the parity estimate approximate; it is a pragmatic, not exact, estimate.
+Forward and discount factor (the Cboe VIX-methodology approach): the discount factor comes
+from a risk-free ``rate`` (``df = exp(-rate T)``), and the forward from put–call parity at the
+money: among strikes quoted on both sides, take the three where ``|C - P|`` (mid prices) is
+smallest and use the median of ``K + (C - P) / df``. No dividend assumption is needed. Near the
+money, American early-exercise premia are small, so this is robust for American-style equity
+options such as SPY. A least-squares regression of ``C - P`` on ``K`` over a wide strike window
+was tried first and rejected: on live SPY chains the in-the-money puts' early-exercise premium
+bent the regression to discount factors above 1 (a negative rate). If no strike is quoted on
+both sides, the expiry falls back to ``F = S exp(rate T)`` (method ``"fallback"``). Only OTM
+options are used for implied vols, which keeps the early-exercise bias out of the smile.
 
 Conventions: ``T`` = calendar days to expiry / 365, days counted from ``now.date()`` to the
 expiry date. Quotes need ``bid > 0``, ``ask >= bid`` and finite values. The OTM option per
 strike is used (put if ``K < F`` else call). ``n_dropped`` counts OTM-side quotes that were
 unusable (bad quote, or no implied vol for the mid). ``noise`` is ``nan`` (unknown; written as
-``null`` in JSON) and ``seed`` is None. ``spec.r`` is ``fallback_rate`` and ``spec.q`` is 0 only
-as placeholders; the per-quote ``forward``/``discount_factor`` are authoritative.
+``null`` in JSON) and ``seed`` is None. ``spec.r`` is ``rate``; ``spec.q`` is 0 only as a
+placeholder; the per-quote ``forward``/``discount_factor`` are authoritative.
 
 Terms: the Yahoo! Finance API is intended for personal use only; yfinance is not affiliated with
 Yahoo. Data fetched with this module is never committed: default output paths live under
@@ -39,8 +42,7 @@ from .market import MarketData, MarketSpec, Quote
 
 __all__ = ["fetch_market", "fetch_market_with_info"]
 
-_PARITY_WINDOW = 0.10
-_MIN_PARITY_STRIKES = 3
+_ATM_PARITY_STRIKES = 3  # strikes with the smallest |C - P| used for the forward
 
 
 def _col(frame: Any, name: str) -> NDArray:
@@ -54,22 +56,22 @@ def _clean(frame: Any) -> dict[float, tuple[float, float]]:
     return {float(k): (float(b), float(a)) for k, b, a in zip(K[ok], bid[ok], ask[ok], strict=True)}
 
 
-def _parity_fit(
-    calls: dict[float, tuple[float, float]], puts: dict[float, tuple[float, float]], spot: float
-) -> tuple[float, float] | None:
-    ks = sorted(k for k in calls.keys() & puts.keys() if abs(k / spot - 1.0) <= _PARITY_WINDOW)
-    if len(ks) < _MIN_PARITY_STRIKES:
+def _atm_forward(
+    calls: dict[float, tuple[float, float]],
+    puts: dict[float, tuple[float, float]],
+    df: float,
+) -> float | None:
+    """Forward from put–call parity near the money: median of ``K + (C - P) / df``.
+
+    Uses the strikes quoted on both sides with the smallest ``|C - P|`` (mid prices).
+    """
+    two_sided = calls.keys() & puts.keys()
+    if not two_sided:
         return None
-    K = np.array(ks)
-    diff = np.array([0.5 * sum(calls[k]) - 0.5 * sum(puts[k]) for k in ks])
-    slope, intercept = np.polyfit(K, diff, 1)
-    df = -float(slope)
-    if not (math.isfinite(df) and 0.5 < df <= 1.05):
-        return None
-    F = float(intercept) / df
-    if not (math.isfinite(F) and F > 0):
-        return None
-    return F, df
+    diff = {k: 0.5 * sum(calls[k]) - 0.5 * sum(puts[k]) for k in two_sided}
+    nearest = sorted(two_sided, key=lambda k: abs(diff[k]))[:_ATM_PARITY_STRIKES]
+    F = float(np.median([k + diff[k] / df for k in nearest]))
+    return F if math.isfinite(F) and F > 0 else None
 
 
 def _spot(ticker: Any) -> float:
@@ -90,13 +92,14 @@ def fetch_market_with_info(
     max_expiries: int = 8,
     min_days: int = 7,
     max_days: int = 730,
-    fallback_rate: float = 0.04,
+    rate: float = 0.04,
     now: datetime | None = None,
     ticker_factory: Callable[[str], Any] | None = None,
 ) -> tuple[MarketData, dict]:
     """Fetch quotes; return ``(market, info)`` with ``info[expiry_date]`` diagnostics.
 
-    Each info entry has ``T``, ``F``, ``df``, ``method`` (``"parity"``/``"fallback"``) and
+    ``rate`` is the continuously compounded risk-free rate used for discounting.
+    Each info entry has ``T``, ``F``, ``df``, ``method`` (``"parity-atm"``/``"fallback"``) and
     ``n_quotes``. ``ticker_factory(symbol)`` must return a yfinance-like ticker (``.options``,
     ``.option_chain(date)`` with ``.calls``/``.puts``, ``.fast_info``); default is
     ``yfinance.Ticker``.
@@ -131,15 +134,12 @@ def fetch_market_with_info(
             info[date] = {"T": T, "F": math.nan, "df": math.nan, "method": "no data", "n_quotes": 0}
             continue
         calls, puts = _clean(chain.calls), _clean(chain.puts)
-        fit = _parity_fit(calls, puts, spot)
-        if fit is None:
-            F, df, method = (
-                spot * math.exp(fallback_rate * T),
-                math.exp(-fallback_rate * T),
-                "fallback",
-            )
+        df = math.exp(-rate * T)
+        F_atm = _atm_forward(calls, puts, df)
+        if F_atm is None:
+            F, method = spot * math.exp(rate * T), "fallback"
         else:
-            (F, df), method = fit, "parity"
+            F, method = F_atm, "parity-atm"
         all_strikes = set(_col(chain.calls, "strike")) | set(_col(chain.puts, "strike"))
         strikes = sorted(k for k in all_strikes if math.isfinite(k) and k > 0)
         K_l, bid_l, ask_l, call_l = [], [], [], []
@@ -190,9 +190,7 @@ def fetch_market_with_info(
         raise ValueError(f"no usable option quotes found for {symbol!r}")
     expiries = tuple(sorted({q.expiry for q in rows}))
     moneyness = tuple(sorted({round(q.strike / spot, 10) for q in rows}))
-    spec = MarketSpec(
-        spot=spot, r=fallback_rate, q=0.0, expiries=expiries, strike_moneyness=moneyness
-    )
+    spec = MarketSpec(spot=spot, r=rate, q=0.0, expiries=expiries, strike_moneyness=moneyness)
     market = MarketData(spec, None, math.nan, None, dropped, rows)
     return market, info
 
@@ -203,7 +201,7 @@ def fetch_market(
     max_expiries: int = 8,
     min_days: int = 7,
     max_days: int = 730,
-    fallback_rate: float = 0.04,
+    rate: float = 0.04,
     now: datetime | None = None,
     ticker_factory: Callable[[str], Any] | None = None,
 ) -> MarketData:
@@ -213,7 +211,7 @@ def fetch_market(
         max_expiries=max_expiries,
         min_days=min_days,
         max_days=max_days,
-        fallback_rate=fallback_rate,
+        rate=rate,
         now=now,
         ticker_factory=ticker_factory,
     )[0]
