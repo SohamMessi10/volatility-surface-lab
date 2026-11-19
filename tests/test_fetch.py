@@ -84,6 +84,18 @@ def test_expiry_filtering_and_order():
     assert sorted(round(v["T"] * 365) for v in info3.values()) == [3, 30, 90]
 
 
+def test_tenor_selection_picks_nearest_listed_expiries():
+    # Listed (within 7..730 days): 30, 90, 400.
+    _, info = run(tenors=(25, 100, 380))
+    assert sorted(round(v["T"] * 365) for v in info.values()) == [30, 90, 400]
+    # Targets that map to the same expiry are de-duplicated; tenors override max_expiries.
+    _, info = run(tenors=(28, 31, 35), max_expiries=1)
+    assert [round(v["T"] * 365) for v in info.values()] == [30]
+    # Targets outside the allowed range still pick the nearest allowed expiry.
+    _, info = run(tenors=(1, 5000))
+    assert sorted(round(v["T"] * 365) for v in info.values()) == [30, 400]
+
+
 def test_atm_parity_recovers_forward():
     # The model's own rate differs from `rate` at 90 and 400 days (4.5%, 5%); near the money
     # that only enters through (F - K) * (df_true / df - 1), so the forward stays accurate.

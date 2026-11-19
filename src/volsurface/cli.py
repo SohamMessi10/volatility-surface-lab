@@ -322,6 +322,7 @@ def cmd_fetch(args: argparse.Namespace) -> int:
             min_days=args.min_days,
             max_days=args.max_days,
             rate=args.rate,
+            tenors=args.tenors,
         )
     except ImportError as e:
         raise CliError(str(e)) from e
@@ -344,6 +345,17 @@ def cmd_fetch(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- parser
+
+
+def _int_list(text: str) -> list[int]:
+    """argparse type for comma-separated positive integers such as ``14,30,60``."""
+    try:
+        values = [int(x) for x in text.split(",") if x.strip()]
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"expected comma-separated integers, got {text!r}") from e
+    if not values or any(v <= 0 for v in values):
+        raise argparse.ArgumentTypeError(f"expected positive integers, got {text!r}")
+    return values
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -416,6 +428,13 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.04,
         help="risk-free rate for discounting; the forward comes from put-call parity (0.04)",
+    )
+    p.add_argument(
+        "--tenors",
+        type=_int_list,
+        default=None,
+        help="target tenors in days, e.g. 14,30,60,91,182,365: picks the nearest expiry to each "
+        "(default: the first --max-expiries expiries)",
     )
     return ap
 

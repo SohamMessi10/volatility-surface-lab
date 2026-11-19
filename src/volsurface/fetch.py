@@ -30,7 +30,7 @@ Yahoo. Data fetched with this module is never committed: default output paths li
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from typing import Any
 
@@ -74,6 +74,22 @@ def _atm_forward(
     return F if math.isfinite(F) and F > 0 else None
 
 
+def _select_expiries(
+    listed: Sequence[tuple[str, int]], tenors: Sequence[int] | None, max_expiries: int
+) -> list[tuple[str, int]]:
+    """Expiries to use: the first ``max_expiries`` by date, or the nearest to each target tenor.
+
+    ``listed`` holds ``(date, days)`` pairs already filtered to the allowed day range. With
+    ``tenors`` (days), each target picks the listed expiry closest to it (ties: the earlier);
+    duplicates are dropped, so fewer expiries than targets can come back.
+    """
+    ordered = sorted(listed, key=lambda x: x[1])
+    if not tenors:
+        return ordered[:max_expiries]
+    picked = {min(ordered, key=lambda x: (abs(x[1] - target), x[1])) for target in tenors}
+    return sorted(picked, key=lambda x: x[1]) if ordered else []
+
+
 def _spot(ticker: Any) -> float:
     try:
         s = float(ticker.fast_info["lastPrice"])
@@ -93,12 +109,16 @@ def fetch_market_with_info(
     min_days: int = 7,
     max_days: int = 730,
     rate: float = 0.04,
+    tenors: Sequence[int] | None = None,
     now: datetime | None = None,
     ticker_factory: Callable[[str], Any] | None = None,
 ) -> tuple[MarketData, dict]:
     """Fetch quotes; return ``(market, info)`` with ``info[expiry_date]`` diagnostics.
 
     ``rate`` is the continuously compounded risk-free rate used for discounting.
+    ``tenors`` (days, e.g. ``(14, 30, 60, 91, 182, 365)``) selects the listed expiry nearest to
+    each target, spreading the slices across the surface; without it the first
+    ``max_expiries`` expiries are used (for SPY these are mostly weeklies).
     Each info entry has ``T``, ``F``, ``df``, ``method`` (``"parity-atm"``/``"fallback"``) and
     ``n_quotes``. ``ticker_factory(symbol)`` must return a yfinance-like ticker (``.options``,
     ``.option_chain(date)`` with ``.calls``/``.puts``, ``.fast_info``); default is
@@ -117,12 +137,12 @@ def fetch_market_with_info(
     ticker = ticker_factory(symbol)
     spot = _spot(ticker)
 
-    chosen: list[tuple[str, int]] = []
+    listed: list[tuple[str, int]] = []
     for date in ticker.options:
         days = (datetime.strptime(str(date), "%Y-%m-%d").date() - now.date()).days
         if min_days <= days <= max_days:
-            chosen.append((str(date), days))
-    chosen = sorted(chosen, key=lambda x: x[1])[:max_expiries]
+            listed.append((str(date), days))
+    chosen = _select_expiries(listed, tenors, max_expiries)
 
     rows: list[Quote] = []
     info: dict[str, dict] = {}
@@ -202,6 +222,7 @@ def fetch_market(
     min_days: int = 7,
     max_days: int = 730,
     rate: float = 0.04,
+    tenors: Sequence[int] | None = None,
     now: datetime | None = None,
     ticker_factory: Callable[[str], Any] | None = None,
 ) -> MarketData:
@@ -212,6 +233,7 @@ def fetch_market(
         min_days=min_days,
         max_days=max_days,
         rate=rate,
+        tenors=tenors,
         now=now,
         ticker_factory=ticker_factory,
     )[0]
