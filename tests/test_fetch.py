@@ -224,6 +224,26 @@ def test_no_quotes_raises():
         run(ticker=t)
 
 
+def test_retries_when_yahoo_returns_no_expiries():
+    # Rate-limited responses come back as an empty expiry list; two of those, then data.
+    good = make_ticker()
+    empty = SimpleNamespace(options=(), fast_info={"lastPrice": SPOT})
+    queue = [empty, empty, good]
+    waits = []
+    market, _ = fetch_market_with_info(
+        "TEST", now=NOW, ticker_factory=lambda s: queue.pop(0), sleep=waits.append
+    )
+    assert len(market.rows) > 0
+    assert waits == [5.0, 10.0]  # exponential backoff, no real sleeping in tests
+
+    waits.clear()
+    with pytest.raises(ValueError, match="no option expiries"):
+        fetch_market_with_info(
+            "TEST", now=NOW, ticker_factory=lambda s: empty, sleep=waits.append, retries=2
+        )
+    assert waits == [5.0, 10.0]
+
+
 def test_fetch_market_returns_market():
     m = fetch_market("TEST", now=NOW, ticker_factory=lambda s: make_ticker())
     assert len(m.rows) > 0

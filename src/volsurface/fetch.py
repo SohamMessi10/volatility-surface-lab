@@ -32,6 +32,7 @@ Yahoo. Data fetched with this module is never committed: default output paths li
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Callable, Sequence
 from datetime import datetime
 from typing import Any
@@ -123,8 +124,10 @@ def fetch_market_with_info(
     tenors: Sequence[int] | None = None,
     min_bid: float = 0.05,
     max_rel_spread: float = 0.5,
+    retries: int = 3,
     now: datetime | None = None,
     ticker_factory: Callable[[str], Any] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> tuple[MarketData, dict]:
     """Fetch quotes; return ``(market, info)`` with ``info[expiry_date]`` diagnostics.
 
@@ -132,6 +135,8 @@ def fetch_market_with_info(
     ``tenors`` (days, e.g. ``(14, 30, 60, 91, 182, 365)``) selects the listed expiry nearest to
     each target, spreading the slices across the surface; without it the first
     ``max_expiries`` expiries are used (for SPY these are mostly weeklies).
+    When Yahoo rate-limits, ``ticker.options`` can come back empty; the request is retried up
+    to ``retries`` times with exponential backoff (5, 10, 20 s) before giving up.
     Each info entry has ``T``, ``F``, ``df``, ``method`` (``"parity-atm"``/``"fallback"``) and
     ``n_quotes``. ``ticker_factory(symbol)`` must return a yfinance-like ticker (``.options``,
     ``.option_chain(date)`` with ``.calls``/``.puts``, ``.fast_info``); default is
@@ -150,8 +155,21 @@ def fetch_market_with_info(
     ticker = ticker_factory(symbol)
     spot = _spot(ticker)
 
+    options = tuple(ticker.options)
+    for attempt in range(retries):
+        if options:
+            break
+        sleep(5.0 * 2**attempt)
+        ticker = ticker_factory(symbol)
+        options = tuple(ticker.options)
+    if not options:
+        raise ValueError(
+            f"Yahoo returned no option expiries for {symbol!r} after {retries + 1} attempts "
+            "(rate-limited or unknown symbol?); wait a minute and try again"
+        )
+
     listed: list[tuple[str, int]] = []
-    for date in ticker.options:
+    for date in options:
         days = (datetime.strptime(str(date), "%Y-%m-%d").date() - now.date()).days
         if min_days <= days <= max_days:
             listed.append((str(date), days))
@@ -239,8 +257,10 @@ def fetch_market(
     tenors: Sequence[int] | None = None,
     min_bid: float = 0.05,
     max_rel_spread: float = 0.5,
+    retries: int = 3,
     now: datetime | None = None,
     ticker_factory: Callable[[str], Any] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> MarketData:
     """Like :func:`fetch_market_with_info` but returns only the market."""
     return fetch_market_with_info(
@@ -252,6 +272,8 @@ def fetch_market(
         tenors=tenors,
         min_bid=min_bid,
         max_rel_spread=max_rel_spread,
+        retries=retries,
         now=now,
         ticker_factory=ticker_factory,
+        sleep=sleep,
     )[0]
