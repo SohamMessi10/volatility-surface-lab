@@ -173,13 +173,35 @@ def test_bad_quotes_dropped():
         fr["puts"]["bid"][i90], fr["puts"]["ask"][i90] = 5.0, 4.0
         fr["puts"]["ask"][i85] = float("nan")
 
-    clean, _ = run()
-    market, _ = run(ticker=make_ticker((30,), {30: mutate}))
+    # Disable the min-bid / spread filters so only the bad-quote rules are exercised.
+    no_filters = {"min_bid": 0.0, "max_rel_spread": math.inf}
+    clean, _ = run(**no_filters)
+    market, _ = run(ticker=make_ticker((30,), {30: mutate}), **no_filters)
     strikes = {q.strike for q in market.rows}
     assert not strikes & {105.0, 90.0, 85.0}
     assert market.n_dropped >= 3
     assert strikes <= {q.strike for q in clean.rows}
     assert len(strikes) >= 8
+
+
+def test_min_bid_and_spread_filters():
+    def mutate(fr):
+        i100, i110 = (list(STRIKES).index(k) for k in (100.0, 110.0))
+        fr["calls"]["bid"][i110] = 0.03  # positive but below min_bid
+        fr["calls"]["ask"][i110] = 0.04
+        mid = 0.5 * (fr["calls"]["bid"][i100] + fr["calls"]["ask"][i100])
+        fr["calls"]["bid"][i100] = 0.6 * mid  # spread 0.8 * mid > 0.5 * mid
+        fr["calls"]["ask"][i100] = 1.4 * mid
+
+    market, _ = run(ticker=make_ticker((30,), {30: mutate}))
+    strikes = {q.strike for q in market.rows if q.option_type == "call"}
+    assert 110.0 not in strikes
+    assert 100.0 not in strikes
+    loose, _ = run(ticker=make_ticker((30,), {30: mutate}), min_bid=0.0, max_rel_spread=1.0)
+    assert {100.0, 110.0} <= {q.strike for q in loose.rows}
+    for q in market.rows:
+        assert q.bid >= 0.05
+        assert q.ask - q.bid <= 0.5 * q.mid + 1e-12
 
 
 def test_fallback_when_no_strike_is_quoted_on_both_sides():

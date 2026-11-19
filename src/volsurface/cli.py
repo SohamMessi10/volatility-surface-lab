@@ -323,6 +323,8 @@ def cmd_fetch(args: argparse.Namespace) -> int:
             max_days=args.max_days,
             rate=args.rate,
             tenors=args.tenors,
+            min_bid=args.min_bid,
+            max_rel_spread=args.max_spread,
         )
     except ImportError as e:
         raise CliError(str(e)) from e
@@ -435,6 +437,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="target tenors in days, e.g. 14,30,60,91,182,365: picks the nearest expiry to each "
         "(default: the first --max-expiries expiries)",
+    )
+    p.add_argument("--min-bid", type=float, default=0.05, help="drop quotes bid below this (0.05)")
+    p.add_argument(
+        "--max-spread",
+        type=float,
+        default=0.5,
+        help="drop quotes whose bid-ask spread exceeds this fraction of the mid (0.5)",
     )
     return ap
 

@@ -16,7 +16,9 @@ both sides, the expiry falls back to ``F = S exp(rate T)`` (method ``"fallback"`
 options are used for implied vols, which keeps the early-exercise bias out of the smile.
 
 Conventions: ``T`` = calendar days to expiry / 365, days counted from ``now.date()`` to the
-expiry date. Quotes need ``bid > 0``, ``ask >= bid`` and finite values. The OTM option per
+expiry date. Quotes need finite values, ``ask >= bid``, ``bid >= min_bid`` (default 0.05) and a
+spread of at most ``max_rel_spread`` (default 0.5) of the mid: penny-wide deep-OTM quotes such
+as 0.02 x 0.03 carry almost no information about the implied vol. The OTM option per
 strike is used (put if ``K < F`` else call). ``n_dropped`` counts OTM-side quotes that were
 unusable (bad quote, or no implied vol for the mid). ``noise`` is ``nan`` (unknown; written as
 ``null`` in JSON) and ``seed`` is None. ``spec.r`` is ``rate``; ``spec.q`` is 0 only as a
@@ -49,10 +51,19 @@ def _col(frame: Any, name: str) -> NDArray:
     return np.asarray(frame[name], dtype=float)
 
 
-def _clean(frame: Any) -> dict[float, tuple[float, float]]:
-    """Map strike -> (bid, ask) for valid quotes (bid > 0, ask >= bid, finite)."""
+def _clean(
+    frame: Any, min_bid: float = 0.05, max_rel_spread: float = 0.5
+) -> dict[float, tuple[float, float]]:
+    """Map strike -> (bid, ask) for usable quotes.
+
+    Usable: finite, ``bid > 0``, ``bid >= min_bid``, ``ask >= bid`` and
+    ``(ask - bid) <= max_rel_spread * mid``.
+    """
     K, bid, ask = _col(frame, "strike"), _col(frame, "bid"), _col(frame, "ask")
-    ok = np.isfinite(K) & np.isfinite(bid) & np.isfinite(ask) & (bid > 0) & (ask >= bid)
+    with np.errstate(invalid="ignore"):
+        ok = np.isfinite(K) & np.isfinite(bid) & np.isfinite(ask) & (bid > 0) & (ask >= bid)
+        ok &= bid >= min_bid
+        ok &= (ask - bid) <= max_rel_spread * 0.5 * (ask + bid)
     return {float(k): (float(b), float(a)) for k, b, a in zip(K[ok], bid[ok], ask[ok], strict=True)}
 
 
@@ -110,6 +121,8 @@ def fetch_market_with_info(
     max_days: int = 730,
     rate: float = 0.04,
     tenors: Sequence[int] | None = None,
+    min_bid: float = 0.05,
+    max_rel_spread: float = 0.5,
     now: datetime | None = None,
     ticker_factory: Callable[[str], Any] | None = None,
 ) -> tuple[MarketData, dict]:
@@ -153,7 +166,8 @@ def fetch_market_with_info(
         if chain is None or chain.calls is None or chain.puts is None:
             info[date] = {"T": T, "F": math.nan, "df": math.nan, "method": "no data", "n_quotes": 0}
             continue
-        calls, puts = _clean(chain.calls), _clean(chain.puts)
+        calls = _clean(chain.calls, min_bid, max_rel_spread)
+        puts = _clean(chain.puts, min_bid, max_rel_spread)
         df = math.exp(-rate * T)
         F_atm = _atm_forward(calls, puts, df)
         if F_atm is None:
@@ -223,6 +237,8 @@ def fetch_market(
     max_days: int = 730,
     rate: float = 0.04,
     tenors: Sequence[int] | None = None,
+    min_bid: float = 0.05,
+    max_rel_spread: float = 0.5,
     now: datetime | None = None,
     ticker_factory: Callable[[str], Any] | None = None,
 ) -> MarketData:
@@ -234,6 +250,8 @@ def fetch_market(
         max_days=max_days,
         rate=rate,
         tenors=tenors,
+        min_bid=min_bid,
+        max_rel_spread=max_rel_spread,
         now=now,
         ticker_factory=ticker_factory,
     )[0]
