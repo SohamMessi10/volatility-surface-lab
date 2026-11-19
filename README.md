@@ -94,21 +94,23 @@ vsl run --outdir out --noise 1 --seed 3 --xi 0.8 --rho -0.5 --expiries 0.25,0.5,
 4.9 MB. `--plotlyjs cdn` links plotly.js and gives a file of about 120 kB that needs network access
 to render (sizes from `PROGRESS.md`, M7).
 
-### Real data (optional, not verified live)
+### Real data (optional): live SPY via Yahoo Finance
 
 ```bash
 pip install -e ".[fetch]"
-vsl fetch SPY                 # writes data/spy.json
-vsl calibrate data/spy.json -o fit.json
+vsl fetch SPY --tenors 14,30,60,91,182,365 --rate 0.0423 -o data/spy.json
+vsl calibrate data/spy.json -o data/spy-fit.json
+vsl check data/spy-fit.json
 ```
 
 `vsl fetch` is for personal use only, in line with the Yahoo Finance terms. Fetched data is
 written to `data/`, which is git-ignored, so it is not committed by accident; do not commit or
-redistribute it. The live call was **not run**:
-the build environment's proxy refuses Yahoo hosts (HTTP 403). The code is tested offline with a
-fake chain (`tests/test_fetch.py`) and checked against the installed yfinance source. Treat it as
-implemented, not field-tested. Options: `--max-expiries` (8), `--min-days` (7), `--max-days` (730),
-`-o`.
+redistribute it. Options: `--tenors` (target days; picks the nearest listed expiry to each),
+`--rate` (risk-free rate for discounting, 0.04), `--min-bid` (0.05), `--max-spread` (0.5 of the
+mid), `--max-expiries` (8, used without `--tenors`), `--min-days` (7), `--max-days` (730), `-o`.
+The forward comes from put–call parity at the money (Cboe VIX method), so no dividend input is
+needed. If Yahoo rate-limits, the request is retried with backoff and then fails with exit 3.
+Results of one live run are in [Live SPY snapshot](#live-spy-snapshot).
 
 ### Exit codes
 
@@ -341,6 +343,41 @@ Read the 3 / 20 result carefully. Each expiry is fitted independently, which doe
 arbitrage-free extrapolation beyond the quotes. In the demo market (seed 3) the single violation
 is a calendar violation purely in the extrapolated wings.
 
+### Live SPY snapshot
+
+One run on 2026-11-19 at 22:10 UTC (17:10 New York, after the close, so end-of-day quotes),
+spot 715.87. The rate was 4.23% continuously compounded, converted from the 13-week T-bill
+yield (Yahoo `^IRX`, 4.147%, treated as a discount-basis quote). Target tenors 14/30/60/91/182/365 days picked expiries at 15, 29, 57,
+92, 162 and 393 days. Default filters (bid >= 0.05, spread <= 50% of mid) kept **949** OTM quotes
+and dropped 209. All six forwards came from at-the-money parity; the 29-day forward (717.53) is below the
+15-day one (717.69), which a dividend going ex between those two dates would explain. Only aggregate
+statistics are reported here; the quotes themselves are not redistributed.
+
+Unweighted SVI fit (`vsl calibrate` defaults), errors vs market mid IV in vol points:
+
+| Expiry (days) | Quotes | ATM IV | RMSE | Max abs error |
+|---|---|---|---|---|
+| 15 | 124 | 23.7% | 0.415 | 0.82 |
+| 29 | 214 | 23.0% | 0.422 | 0.97 |
+| 57 | 142 | 21.6% | 0.314 | 0.85 |
+| 92 | 111 | 20.6% | 0.258 | 0.58 |
+| 162 | 134 | 20.4% | 0.116 | 0.27 |
+| 393 | 224 | 19.9% | 0.384 | 2.86 (deep OTM put, k = −2.4) |
+
+What the numbers say:
+
+- **Max per-expiry RMSE is 0.42 vol points**, but the median bid-ask width is 0.135 vol points,
+  and only 243 of 949 fitted vols (26%) fall inside the bid-ask. Raw SVI's five parameters do not
+  follow SPY's short-dated smile across the whole quoted range.
+- **The error is systematic, not noise.** At 29 days the fit sits about 0.5 vol points below the
+  near-the-money puts while the quotes are smooth across the put/call boundary, so the forward is
+  not the cause.
+- **Weighting by the bid-ask spread is a trade-off, not a fix** (tested, not shipped): near-the-money
+  RMSE at 29 days falls from 0.51 to 0.26, but max RMSE rises to 0.62 and fewer fits land inside
+  the bid-ask (182 of 949).
+- **Arbitrage:** none inside the quoted ranges; 6 butterfly and 4 calendar violations in the
+  extrapolated wings of the [−1.5, 1.5] check grid.
+
 ## 7. Verification
 
 `pytest` collects 148 tests across 10 modules; all pass locally and in CI. Hypothesis is used for property tests.
@@ -360,7 +397,7 @@ numbers close to 0.5, and the test's tolerance now uses the condition number of 
 | `pipeline` | Clean Heston surface passes; injected calendar and butterfly violations located; noisy market has no arbitrage inside the quoted range; report serializes |
 | `plotting` | Figure traces; surface grid includes expiries and does not extrapolate; interpolated variance monotone in T; violation markers; CDN and inline HTML; HTML escaping |
 | `cli` | End-to-end commands; CSV input; CDN and inline; arbitrage exit code; missing, malformed and invalid inputs; usage errors; output directories created; `fetch` error paths |
-| `fetch` | Expiry filtering; parity recovers forward and discount factor; OTM selection; bad quotes dropped; fallback with too few strikes; JSON round trip. All against a fake chain |
+| `fetch` | Expiry filtering and tenor selection; ATM parity recovers the forward, including with an American early-exercise premium on ITM puts; OTM selection; bad-quote, min-bid and spread filters; retry with backoff; fallback with no two-sided strikes; JSON round trip. All against a fake chain |
 
 **CI** (`.github/workflows/ci.yml`): on push to `main`, pull requests and manual dispatch, a matrix
 of Python 3.12 and 3.13 runs `ruff check .`, `ruff format --check .` and `pytest -q`.
@@ -429,10 +466,13 @@ Limitations:
   20,000 in the benchmark), and far in the wings with tiny total vol the direct Black formula loses
   digits to cancellation (noted in `PROGRESS.md`, M2). Jäckel's "Let's Be Rational" is the
   reference for a solver that avoids this; it is not implemented here.
-- **No vega or bid/ask weighting** is used by `vsl calibrate`.
-- **Real-data fetch is unverified live.** `vsl fetch` was not run against Yahoo here. It estimates
-  forward and discount factor by put–call parity, which is approximate for American-style equity
-  options, and applies no early-exercise adjustment.
+- **No vega or bid/ask weighting** is used by `vsl calibrate`. On live SPY a spread-weighted fit
+  improved the near-the-money error but worsened the overall fit (see the live snapshot).
+- **Raw SVI under-fits real short-dated SPY smiles:** max RMSE 0.42 vol points against a median
+  bid-ask width of 0.135, with only 26% of fitted vols inside the bid-ask.
+- **SPY options are American.** The fetch uses only OTM options and an at-the-money parity forward,
+  which keeps early-exercise effects small, but applies no explicit early-exercise adjustment.
+  The discount rate is an input (`--rate`), not estimated from the chain.
 - **Timings are from one cloud container** and will differ on other hardware.
 - **No Heston calibration:** the Heston parameters are inputs to the generator, not outputs of a fit.
 

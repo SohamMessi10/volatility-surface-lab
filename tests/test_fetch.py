@@ -84,17 +84,61 @@ def test_expiry_filtering_and_order():
     assert sorted(round(v["T"] * 365) for v in info3.values()) == [3, 30, 90]
 
 
-def test_parity_recovers_forward_and_discount_factor():
-    _, info = run()
-    errs_F, errs_df = [], []
+def test_tenor_selection_picks_nearest_listed_expiries():
+    # Listed (within 7..730 days): 30, 90, 400.
+    _, info = run(tenors=(25, 100, 380))
+    assert sorted(round(v["T"] * 365) for v in info.values()) == [30, 90, 400]
+    # Targets that map to the same expiry are de-duplicated; tenors override max_expiries.
+    _, info = run(tenors=(28, 31, 35), max_expiries=1)
+    assert [round(v["T"] * 365) for v in info.values()] == [30]
+    # Targets outside the allowed range still pick the nearest allowed expiry.
+    _, info = run(tenors=(1, 5000))
+    assert sorted(round(v["T"] * 365) for v in info.values()) == [30, 400]
+
+
+def test_atm_parity_recovers_forward():
+    # The model's own rate differs from `rate` at 90 and 400 days (4.5%, 5%); near the money
+    # that only enters through (F - K) * (df_true / df - 1), so the forward stays accurate.
+    _, info = run(rate=0.04)
+    errs_F = []
     for d in info.values():
         days = round(d["T"] * 365)
-        F, df, _ = model_fd(days)
-        assert d["method"] == "parity"
+        F, _, T = model_fd(days)
+        assert d["method"] == "parity-atm"
+        assert d["df"] == pytest.approx(math.exp(-0.04 * T), rel=1e-15)
         errs_F.append(abs(d["F"] / F - 1))
-        errs_df.append(abs(d["df"] - df))
     assert max(errs_F) < 2e-4
-    assert max(errs_df) < 2e-3
+
+
+def test_forward_robust_to_american_early_exercise_premium():
+    # Live SPY options are American: in-the-money puts trade above their European value.
+    # Add such a premium (growing with depth) to the fake puts. A C - P regression on K over a
+    # wide window then implies a discount factor above 1 (seen on live SPY chains); the ATM
+    # parity estimate must still recover the forward.
+    def mutate(fr):
+        F, _, _ = model_fd(90)
+        for i, k in enumerate(STRIKES):
+            if k > F:
+                premium = 0.05 * (k - F)  # 0.5 on a 10-point-ITM put (upper bound ~K r T = 1.2)
+                fr["puts"]["bid"][i] += premium
+                fr["puts"]["ask"][i] += premium
+
+    _, info = run(ticker=make_ticker((90,), {90: mutate}))
+    (d,) = info.values()
+    F, _, _ = model_fd(90)
+    assert d["method"] == "parity-atm"
+    assert abs(d["F"] / F - 1) < 5e-4
+    # The rejected approach on the same quotes: slope of C - P against K over +-10%.
+    t = make_ticker((90,), {90: mutate})
+    ch = t.option_chain(_date(90))
+    K = np.array(ch.calls["strike"])
+    c_mid = 0.5 * (np.array(ch.calls["bid"]) + np.array(ch.calls["ask"]))
+    p_mid = 0.5 * (np.array(ch.puts["bid"]) + np.array(ch.puts["ask"]))
+    sel = np.abs(K / SPOT - 1) <= 0.10
+    slope = np.polyfit(K[sel], (c_mid - p_mid)[sel], 1)[0]
+    _, df_true, _ = model_fd(90)
+    assert -slope > df_true + 0.01  # biased upward by the premium...
+    assert -slope > 1.0  # ...to an implied df above 1, i.e. a negative interest rate
 
 
 def test_iv_mid_matches_model_and_otm_selection():
@@ -129,8 +173,10 @@ def test_bad_quotes_dropped():
         fr["puts"]["bid"][i90], fr["puts"]["ask"][i90] = 5.0, 4.0
         fr["puts"]["ask"][i85] = float("nan")
 
-    clean, _ = run()
-    market, _ = run(ticker=make_ticker((30,), {30: mutate}))
+    # Disable the min-bid / spread filters so only the bad-quote rules are exercised.
+    no_filters = {"min_bid": 0.0, "max_rel_spread": math.inf}
+    clean, _ = run(**no_filters)
+    market, _ = run(ticker=make_ticker((30,), {30: mutate}), **no_filters)
     strikes = {q.strike for q in market.rows}
     assert not strikes & {105.0, 90.0, 85.0}
     assert market.n_dropped >= 3
@@ -138,15 +184,32 @@ def test_bad_quotes_dropped():
     assert len(strikes) >= 8
 
 
-def test_fallback_when_too_few_two_sided_strikes():
+def test_min_bid_and_spread_filters():
     def mutate(fr):
-        # keep only two strikes quoted on both sides inside +-10%: zero the puts elsewhere
-        keep = {95.0, 105.0}
-        for i, k in enumerate(STRIKES):
-            if k not in keep:
-                fr["puts"]["bid"][i] = 0.0
+        i100, i110 = (list(STRIKES).index(k) for k in (100.0, 110.0))
+        fr["calls"]["bid"][i110] = 0.03  # positive but below min_bid
+        fr["calls"]["ask"][i110] = 0.04
+        mid = 0.5 * (fr["calls"]["bid"][i100] + fr["calls"]["ask"][i100])
+        fr["calls"]["bid"][i100] = 0.6 * mid  # spread 0.8 * mid > 0.5 * mid
+        fr["calls"]["ask"][i100] = 1.4 * mid
 
-    market, info = run(ticker=make_ticker((30,), {30: mutate}), fallback_rate=0.03)
+    market, _ = run(ticker=make_ticker((30,), {30: mutate}))
+    strikes = {q.strike for q in market.rows if q.option_type == "call"}
+    assert 110.0 not in strikes
+    assert 100.0 not in strikes
+    loose, _ = run(ticker=make_ticker((30,), {30: mutate}), min_bid=0.0, max_rel_spread=1.0)
+    assert {100.0, 110.0} <= {q.strike for q in loose.rows}
+    for q in market.rows:
+        assert q.bid >= 0.05
+        assert q.ask - q.bid <= 0.5 * q.mid + 1e-12
+
+
+def test_fallback_when_no_strike_is_quoted_on_both_sides():
+    def mutate(fr):
+        for i in range(len(STRIKES)):
+            fr["puts"]["bid"][i] = 0.0
+
+    market, info = run(ticker=make_ticker((30,), {30: mutate}), rate=0.03)
     (d,) = info.values()
     T = 30 / 365
     assert d["method"] == "fallback"
@@ -159,6 +222,26 @@ def test_no_quotes_raises():
     t = make_ticker((3,))
     with pytest.raises(ValueError, match="no usable"):
         run(ticker=t)
+
+
+def test_retries_when_yahoo_returns_no_expiries():
+    # Rate-limited responses come back as an empty expiry list; two of those, then data.
+    good = make_ticker()
+    empty = SimpleNamespace(options=(), fast_info={"lastPrice": SPOT})
+    queue = [empty, empty, good]
+    waits = []
+    market, _ = fetch_market_with_info(
+        "TEST", now=NOW, ticker_factory=lambda s: queue.pop(0), sleep=waits.append
+    )
+    assert len(market.rows) > 0
+    assert waits == [5.0, 10.0]  # exponential backoff, no real sleeping in tests
+
+    waits.clear()
+    with pytest.raises(ValueError, match="no option expiries"):
+        fetch_market_with_info(
+            "TEST", now=NOW, ticker_factory=lambda s: empty, sleep=waits.append, retries=2
+        )
+    assert waits == [5.0, 10.0]
 
 
 def test_fetch_market_returns_market():

@@ -182,3 +182,21 @@ def test_generate_with_exploding_moments_uses_lewis_fallback(tmp_path):
     out = tmp_path / "m.json"
     args = ["--v0", "0.04", "--kappa", "0.1", "--theta", "0.04", "--xi", "3", "--rho", "-0.99"]
     assert main(["generate", "-o", str(out), "--expiries", "0.5,5,10", *args]) == 0
+
+
+def test_fetch_tenors_flag_is_parsed_and_validated(monkeypatch, capsys, tmp_path):
+    import volsurface.fetch as fetch_mod
+    from volsurface.market import generate_market
+
+    seen = {}
+
+    def fake(symbol, **kwargs):
+        seen.update(kwargs)
+        return generate_market(), {}
+
+    monkeypatch.setattr(fetch_mod, "fetch_market_with_info", fake)
+    assert main(["fetch", "SPY", "-o", str(tmp_path / "m.json"), "--tenors", "14,30,365"]) == 0
+    assert seen["tenors"] == [14, 30, 365]
+    with pytest.raises(SystemExit) as exc:
+        main(["fetch", "SPY", "--tenors", "14,abc"])
+    assert exc.value.code == 2

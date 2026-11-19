@@ -321,7 +321,10 @@ def cmd_fetch(args: argparse.Namespace) -> int:
             max_expiries=args.max_expiries,
             min_days=args.min_days,
             max_days=args.max_days,
-            fallback_rate=args.fallback_rate,
+            rate=args.rate,
+            tenors=args.tenors,
+            min_bid=args.min_bid,
+            max_rel_spread=args.max_spread,
         )
     except ImportError as e:
         raise CliError(str(e)) from e
@@ -344,6 +347,17 @@ def cmd_fetch(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- parser
+
+
+def _int_list(text: str) -> list[int]:
+    """argparse type for comma-separated positive integers such as ``14,30,60``."""
+    try:
+        values = [int(x) for x in text.split(",") if x.strip()]
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"expected comma-separated integers, got {text!r}") from e
+    if not values or any(v <= 0 for v in values):
+        raise argparse.ArgumentTypeError(f"expected positive integers, got {text!r}")
+    return values
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -412,10 +426,24 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-days", type=int, default=7, help="skip expiries sooner than this (7)")
     p.add_argument("--max-days", type=int, default=730, help="skip expiries later than this (730)")
     p.add_argument(
-        "--fallback-rate",
+        "--rate",
         type=float,
         default=0.04,
-        help="rate used when put-call parity cannot imply the forward (0.04)",
+        help="risk-free rate for discounting; the forward comes from put-call parity (0.04)",
+    )
+    p.add_argument(
+        "--tenors",
+        type=_int_list,
+        default=None,
+        help="target tenors in days, e.g. 14,30,60,91,182,365: picks the nearest expiry to each "
+        "(default: the first --max-expiries expiries)",
+    )
+    p.add_argument("--min-bid", type=float, default=0.05, help="drop quotes bid below this (0.05)")
+    p.add_argument(
+        "--max-spread",
+        type=float,
+        default=0.5,
+        help="drop quotes whose bid-ask spread exceeds this fraction of the mid (0.5)",
     )
     return ap
 
