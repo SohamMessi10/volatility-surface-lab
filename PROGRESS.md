@@ -20,7 +20,7 @@ Linux x86_64, Intel Xeon @ 2.30 GHz, 4 vCPU, Python 3.12.3, numpy 2.5.4, scipy 1
 | 7 | CLI `vsl` (generate / calibrate / check / plot / run) + interactive HTML report | VERIFIED | `tests/test_cli.py`, `tests/test_plotting.py`, rendered in headless Chromium at 1280 px and 390 px |
 | 7b | GitHub Pages demo from `/docs` | BLOCKED | Pages files committed; enabling Pages needs a repo-settings change this session cannot make (see README) |
 | 9 | README (math, architecture, measured results, design notes) | VERIFIED | Numbers cross-checked against `benchmarks/results.json`; Mermaid diagram rendered with mermaid 11.12; example commands executed |
-| 8 | `vsl fetch` (real SPY chain via yfinance, optional extra) | IMPLEMENTED | Offline tests with a fake chain (`tests/test_fetch.py`); live call BLOCKED here: the environment's proxy refuses Yahoo hosts (HTTP 403) |
+| 8 | `vsl fetch` (real SPY chain via yfinance, optional extra) | VERIFIED | Offline tests with a fake chain (`tests/test_fetch.py`); live run on 2026-11-19: 949 SPY quotes, 6 expiries (see "Live SPY run" below) |
 
 ## Log
 
@@ -135,9 +135,8 @@ Linux x86_64, Intel Xeon @ 2.30 GHz, 4 vCPU, Python 3.12.3, numpy 2.5.4, scipy 1
 ### M8 — Optional live fetch
 - Verified against the installed yfinance 1.8.0 source: `Ticker(sym).options`,
   `option_chain(date) -> (calls, puts, underlying)`, column names, `fast_info["lastPrice"]`.
-- Forward and discount factor per expiry are implied by put–call parity (regression of
-  C − P on K near the money), so no dividend/rate guess is needed; fallback to a flat rate
-  is reported per expiry.
+- Forward and discount factor per expiry were first implied by a C − P regression on K over
+  ±10% of spot (replaced after the live run, see below).
 - Yahoo's terms: personal use only. Output defaults to `data/` (git-ignored); nothing fetched
   is committed. A blocked/offline network now maps to exit 3 with a one-line message (found
   by running it here: yfinance raised an internal `TypeError`).
@@ -166,3 +165,23 @@ Linux x86_64, Intel Xeon @ 2.30 GHz, 4 vCPU, Python 3.12.3, numpy 2.5.4, scipy 1
   on a Mac), a per-expiry vs per-strike timing comparison, an undefined d₋, and the SVI σ naming.
 - Open items that need the repository owner: enable GitHub Pages (main, /docs); optionally rename
   the repo to `volatility-surface-lab` and set the description/topics; run `vsl fetch` live.
+
+### Live SPY run (2026-11-19)
+- Network access: a separate environment for this repo allowing only Yahoo's API hosts.
+- First live chains exposed a bug: the C − P regression implied discount factors of 1.009 (8 d)
+  and 1.019 (11 d), i.e. negative rates. SPY options are American; ITM puts' early-exercise
+  premium bends the regression. Replaced by the Cboe VIX approach: df from a risk-free rate, the
+  forward as the median of K + (C − P)/df over the three strikes with the smallest |C − P|. A test
+  reproduces the bias with a synthetic early-exercise premium.
+- Also added: expiry selection by target tenor (`--tenors`), min-bid / max-spread filters, and a
+  retry with backoff when Yahoo rate-limits (it returned an empty expiry list; seen live).
+- Run: 22:10 UTC (after the close), spot 715.87, rate 4.23% (13-week T-bill `^IRX` 4.147%, treated as a
+  discount-basis yield, → continuous), expiries 15/29/57/92/162/393 d, 949 quotes kept / 209 dropped.
+- SVI (unweighted): RMSE 0.415 / 0.422 / 0.314 / 0.258 / 0.116 / 0.384 vol points; max abs 2.86 at
+  k = −2.4 (393 d). Median bid-ask width 0.135 vol points; 243/949 fitted vols inside bid-ask.
+  Near-the-money bias ≈ −0.5 vol points on the 29-day puts; quotes smooth across the put/call
+  boundary, so not a forward error.
+- Experiment (not shipped): bid-ask-spread weighting cut the 29-day near-ATM RMSE 0.51 → 0.26 but
+  raised max RMSE to 0.62 and lowered inside-bid-ask to 182/949. Raw SVI lacks the flexibility.
+- Arbitrage: none inside quoted ranges; 6 butterfly + 4 calendar violations in extrapolated wings.
+- No quote data committed (`data/` is git-ignored); only aggregate statistics are recorded.
